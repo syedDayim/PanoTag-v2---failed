@@ -1,0 +1,9 @@
+# Local uploads / caches (can be hundreds of MB)
+panotag/user_data/
+
+# Local OCR correction DB (optional: remove this line if you want to version it)
+panotag/tags.db
+
+__pycache__/
+*.pyc
+*.pyo

@@ -20,13 +20,21 @@ pip install -r requirements.txt
 > First run downloads ~200 MB of AI model weights automatically.
 > YOLOv8 nano model (~6 MB) + EasyOCR English model (~200 MB).
 
-### 3. Run the app
+### 3. Run the app (desktop)
+
+From the **parent folder** of `panotag` (e.g. your project root):
+
+```bash
+python -m panotag
+```
+
+From inside the `panotag` folder:
 
 ```bash
 python app.py
 ```
 
-Or drag a photo directly:
+Open a photo via **Load photo**, or pass a path:
 
 ```bash
 python app.py path/to/your/photo.jpg

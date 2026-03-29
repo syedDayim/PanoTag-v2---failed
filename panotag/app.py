@@ -23,7 +23,7 @@ Image.MAX_IMAGE_PIXELS = None   # we trust our own files
 from PIL import ImageTk, ImageDraw, ImageFont
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 try:
     import cv2
@@ -52,6 +52,19 @@ except ImportError:
 # ── Working resolution for detection ────────────────────────────────────────
 # Detection runs on a downsampled copy; OCR always uses the original hi-res crop
 DETECT_MAX_W = 4096
+
+# Speed / precision tradeoffs (generic yolov8n.pt is COCO — not tag-specific; it
+# mostly adds false boxes + cost). EasyOCR **full-image** readtext scales badly with
+# width; hi-res **per-crop** OCR still uses the original image.
+USE_YOLO_FOR_TAGS = False
+# ~2400px proposals: much faster than 4096, still beats 1920 for small text.
+TEXT_SCAN_MAX_W = 2400
+# Each candidate runs a separate crop OCR — cap keeps total time bounded.
+MAX_TAG_CANDIDATES = 48
+MIN_REGION_CONF = 0.20
+MIN_OCR_LINE_CONF = 0.20
+MIN_TAG_TEXT_LEN = 1
+NMS_IOU_TAGS = 0.48
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -108,14 +121,43 @@ class TagDetector:
         else:
             self.status_cb("EasyOCR not installed — install with: pip install easyocr")
 
+    @staticmethod
+    def _learned_corrections_lookup() -> dict[str, str]:
+        try:
+            from panotag.db import get_learned_correction_map
+            return get_learned_correction_map()
+        except ImportError:
+            pass
+        except Exception:
+            return {}
+        try:
+            _pd = Path(__file__).resolve().parent
+            if str(_pd) not in sys.path:
+                sys.path.insert(0, str(_pd))
+            import db as _dbmod
+            return _dbmod.get_learned_correction_map()
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _apply_learned_label(raw: str, lookup: dict[str, str]) -> str:
+        s = raw.strip()
+        if not s:
+            return "UNKNOWN"
+        if s.upper() == "UNKNOWN":
+            return s
+        return lookup.get(s.lower(), s)
+
     # ── Main pipeline ────────────────────────────────────────────────────────
-    def detect(self, image_path: str) -> list[dict]:
+    def detect(self, image_path: str, photo_stem: str | None = None) -> list[dict]:
         """
         1. Read full image via OpenCV (no pixel limit)
         2. Downsample to DETECT_MAX_W for region detection
         3. Map detected regions back to original coordinates
         4. OCR each region using the ORIGINAL hi-res crop
         5. Compute pan/tilt from original coordinates
+
+        photo_stem: optional logical name without extension (e.g. when image_path is a temp file).
         """
         self.status_cb(f"Reading image: {Path(image_path).name}")
         img_bgr = cv2.imread(image_path)
@@ -151,63 +193,94 @@ class TagDetector:
             oy2 = max(0, min(int(y2 / scale), orig_h - 1))
             orig_boxes.append((ox1, oy1, ox2, oy2, conf))
 
-        # OCR hi-res crops + pan/tilt
+        lookup = self._learned_corrections_lookup()
+        if lookup:
+            self.status_cb(f"Applying {len(lookup)} learned text correction(s) from database…")
+
         tags = []
-        photo_name = Path(image_path).name
+        photo_name = (photo_stem or Path(image_path).stem).strip() or "photo"
         for i, (x1, y1, x2, y2, conf) in enumerate(orig_boxes):
-            tag_name = self._ocr_hires_crop(img_rgb, x1, y1, x2, y2)
-            corners  = box_to_corners_pan_tilt(x1, y1, x2, y2, orig_w, orig_h)
+            raw_ocr, ocr_conf = self._ocr_hires_crop(img_rgb, x1, y1, x2, y2)
+            if len(raw_ocr.strip()) < MIN_TAG_TEXT_LEN:
+                raw_ocr = "UNKNOWN"
+            resolved = self._apply_learned_label(raw_ocr, lookup)
+            corners = box_to_corners_pan_tilt(x1, y1, x2, y2, orig_w, orig_h)
+            blend = float(conf) * 0.5 + float(ocr_conf) * 0.5
             tags.append({
-                "photo":    photo_name,
-                "tag_id":   i + 1,
-                "tag_name": tag_name,
-                "conf":     round(conf, 3),
+                "photo":       photo_name,
+                "tag_id":      0,
+                "tag_name":    resolved,
+                "system_text": raw_ocr,
+                "ocr_conf":    round(float(ocr_conf), 4),
+                "conf":        round(blend, 3),
                 "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                 **corners
             })
+            disp = (
+                f"'{resolved}'"
+                if resolved == raw_ocr
+                else f"'{resolved}' (OCR was '{raw_ocr}')"
+            )
             self.status_cb(
-                f"  [{i+1}] '{tag_name}'  conf={conf:.2f}  "
+                f"  [{len(tags)}] {disp}  det={conf:.2f} ocr={ocr_conf:.2f}  "
                 f"pan_tl={corners['pan_tl']}  tilt_tl={corners['tilt_tl']}"
             )
 
+        for j, t in enumerate(tags):
+            t["tag_id"] = j + 1
         return tags
 
     # ── Region detection ─────────────────────────────────────────────────────
     def _get_boxes(self, img_rgb, w, h):
         boxes = []
 
-        # A — YOLO
-        if self.yolo is not None:
+        # A — YOLO (optional: default off — COCO weights are not tag/nameplate-specific)
+        if USE_YOLO_FOR_TAGS and self.yolo is not None:
             self.status_cb("Running YOLOv8 detection…")
-            results = self.yolo(img_rgb, verbose=False, conf=0.20,
-                                imgsz=min(w, 1280))
+            results = self.yolo(
+                img_rgb, verbose=False, conf=0.45, imgsz=min(w, 1280)
+            )
             for r in results:
                 for box in r.boxes:
                     x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                     conf = float(box.conf[0])
-                    bw, bh = x2-x1, y2-y1
+                    bw, bh = x2 - x1, y2 - y1
                     if bw > 15 and bh > 8 and 0.1 < bw / max(bh, 1) < 25:
                         boxes.append((x1, y1, x2, y2, conf))
 
-        # B — EasyOCR region scan (finds text locations)
+        # B — EasyOCR region scan on a smaller image (fast proposals; coords → full det space)
         if self.reader is not None:
             self.status_cb("Running EasyOCR region scan…")
             try:
+                if w > TEXT_SCAN_MAX_W:
+                    ts = TEXT_SCAN_MAX_W / w
+                    sw, sh = TEXT_SCAN_MAX_W, max(1, int(h * ts))
+                    scan_bgr = cv2.resize(img_rgb, (sw, sh), interpolation=cv2.INTER_AREA)
+                    sx, sy = w / sw, h / sh
+                else:
+                    scan_bgr = img_rgb
+                    sw, sh = w, h
+                    sx = sy = 1.0
+
                 ocr_raw = self.reader.readtext(
-                    img_rgb, detail=1, paragraph=False,
-                    width_ths=0.8, text_threshold=0.4, low_text=0.3
+                    scan_bgr, detail=1, paragraph=False,
+                    width_ths=0.9, text_threshold=0.32, low_text=0.22,
                 )
                 for (quad, text, conf) in ocr_raw:
-                    if conf < 0.35 or len(text.strip()) < 1:
+                    if conf < MIN_REGION_CONF or len(text.strip()) < 1:
                         continue
                     xs = [p[0] for p in quad]
                     ys = [p[1] for p in quad]
-                    x1, y1 = int(min(xs)), int(min(ys))
-                    x2, y2 = int(max(xs)), int(max(ys))
-                    pad_x = max(10, int((x2-x1)*0.20))
-                    pad_y = max(6,  int((y2-y1)*0.35))
-                    x1 = max(0, x1-pad_x); y1 = max(0, y1-pad_y)
-                    x2 = min(w, x2+pad_x); y2 = min(h, y2+pad_y)
+                    x1 = int(min(xs) * sx)
+                    y1 = int(min(ys) * sy)
+                    x2 = int(max(xs) * sx)
+                    y2 = int(max(ys) * sy)
+                    pad_x = max(10, int((x2 - x1) * 0.18))
+                    pad_y = max(6, int((y2 - y1) * 0.30))
+                    x1 = max(0, x1 - pad_x)
+                    y1 = max(0, y1 - pad_y)
+                    x2 = min(w, x2 + pad_x)
+                    y2 = min(h, y2 + pad_y)
                     boxes.append((x1, y1, x2, y2, conf))
             except Exception as e:
                 self.status_cb(f"EasyOCR scan error: {e}")
@@ -217,7 +290,9 @@ class TagDetector:
             self.status_cb("Using MSER contour fallback…")
             boxes = self._mser_detect(img_rgb, w, h)
 
-        return self._nms(boxes, iou_threshold=0.35)
+        merged = self._nms(boxes, iou_threshold=NMS_IOU_TAGS)
+        merged.sort(key=lambda b: b[4], reverse=True)
+        return merged[:MAX_TAG_CANDIDATES]
 
     def _mser_detect(self, img_rgb, w, h):
         gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
@@ -230,56 +305,56 @@ class TagDetector:
                 continue
             if 0.3 < bw / max(bh, 1) < 20:
                 boxes.append((x, y, x+bw, y+bh, 0.25))
-        return boxes[:60]
+        return boxes[:MAX_TAG_CANDIDATES]
 
     # ── OCR on the ORIGINAL hi-res crop ──────────────────────────────────────
     def _ocr_hires_crop(self, img_rgb, x1, y1, x2, y2):
         """
-        KEY FIX: crop from the full-resolution image.
-        On a 24192px image, a tag that's 300px wide at detection resolution
-        maps to ~1750px wide in the original — plenty for accurate OCR.
-        We scale it down to ~800px for EasyOCR which is the sweet spot.
+        Crop from full-resolution image; return the single best OCR line and its
+        confidence when clear enough — avoids merging every line in the crop.
         """
         if self.reader is None:
-            return "UNKNOWN"
+            return "UNKNOWN", 0.0
 
         crop = img_rgb[y1:y2, x1:x2]
         if crop.size == 0:
-            return "UNKNOWN"
+            return "UNKNOWN", 0.0
 
         ch, cw = crop.shape[:2]
-        self.status_cb(f"    Hi-res OCR crop: {cw}×{ch} px")
 
-        # Scale to OCR sweet spot (~800px wide)
         if cw > 800:
             factor = 800 / cw
-            crop = cv2.resize(crop, (800, max(1, int(ch*factor))),
+            crop = cv2.resize(crop, (800, max(1, int(ch * factor))),
                               interpolation=cv2.INTER_AREA)
         elif cw < 80:
             factor = max(2, 160 // cw)
-            crop = cv2.resize(crop, (cw*factor, ch*factor),
+            crop = cv2.resize(crop, (cw * factor, ch * factor),
                               interpolation=cv2.INTER_CUBIC)
 
-        # Sharpen for real-world label text
-        kernel = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]])
-        crop   = cv2.filter2D(crop, -1, kernel)
+        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+        crop = cv2.filter2D(crop, -1, kernel)
 
         try:
             results = self.reader.readtext(
                 crop, detail=1, paragraph=False,
-                text_threshold=0.30, low_text=0.20, width_ths=0.9
+                text_threshold=0.35, low_text=0.22, width_ths=0.9,
             )
-            texts = [
-                t.strip()
-                for (_, t, c) in sorted(results, key=lambda r: r[2], reverse=True)
-                if c > 0.20 and len(t.strip()) >= 1
-            ]
-            result = " | ".join(texts) if texts else "UNKNOWN"
-            self.status_cb(f"    OCR result: '{result}'")
-            return result
+            if not results:
+                return "UNKNOWN", 0.0
+            best = max(results, key=lambda r: r[2])
+            text, line_conf = best[1].strip(), float(best[2])
+            if len(text) < 1:
+                return "UNKNOWN", line_conf
+            if line_conf < MIN_OCR_LINE_CONF:
+                self.status_cb(
+                    f"    OCR (low conf): '{text[:40]}'  line_conf={line_conf:.2f}"
+                )
+            else:
+                self.status_cb(f"    OCR: '{text[:40]}'  line_conf={line_conf:.2f}")
+            return text, line_conf
         except Exception as e:
             self.status_cb(f"    OCR error: {e}")
-            return "UNKNOWN"
+            return "UNKNOWN", 0.0
 
     def _nms(self, boxes, iou_threshold=0.35):
         if not boxes:
@@ -450,6 +525,7 @@ class PanoTagApp:
         self.detector   = None
         self.photo_img  = None
         self._build_ui()
+        self._init_sqlite()
         self._init_detector()
 
     def _build_ui(self):
@@ -474,6 +550,11 @@ class PanoTagApp:
             bg="#7fff6e",fg="#000",relief="flat",font=("Courier",10,"bold"),
             padx=16,pady=6,state="disabled",command=self._export)
         self.export_btn.pack(side="right",padx=8,pady=10)
+
+        self.edit_tag_btn=tk.Button(top,text="✎  EDIT TAG",
+            bg="#2a3045",fg="#00e5ff",relief="flat",font=("Courier",10,"bold"),
+            padx=12,pady=6,state="disabled",command=self._edit_selected_tag)
+        self.edit_tag_btn.pack(side="right",padx=4,pady=10)
 
         self.load_btn=tk.Button(top,text="▶  LOAD PHOTO",
             bg="#00e5ff",fg="#000",relief="flat",font=("Courier",10,"bold"),
@@ -511,6 +592,7 @@ class PanoTagApp:
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left",fill="both",expand=True,pady=(4,0))
         sb.pack(side="right",fill="y",pady=(4,0))
+        self.tree.bind("<Double-1>", lambda e: self._edit_selected_tag())
 
         log_f=tk.Frame(self.root,bg="#151820",height=140)
         log_f.pack(fill="x",side="bottom")
@@ -539,6 +621,22 @@ class PanoTagApp:
             text="Load a 360° panoramic photo to begin",
             fill="#2a3045",font=("Courier",12))
 
+    def _init_sqlite(self):
+        try:
+            from panotag.db import init_db
+            init_db()
+        except ImportError:
+            try:
+                _pd = Path(__file__).resolve().parent
+                if str(_pd) not in sys.path:
+                    sys.path.insert(0, str(_pd))
+                import db as _dbmod
+                _dbmod.init_db()
+            except Exception as e:
+                self._log(f"Database init skipped: {e}", "warn")
+        except Exception as e:
+            self._log(f"Database init: {e}", "warn")
+
     def _init_detector(self):
         self._log("Initialising models…","info")
         def _init():
@@ -558,6 +656,7 @@ class PanoTagApp:
         self.image_path=path
         self.tags=[]
         self._clear_table()
+        self.edit_tag_btn.config(state="disabled")
         self._show_status(f"Loaded: {Path(path).name}")
         self._log(f"Loaded: {path}","info")
         self._show_raw_preview(path)
@@ -590,9 +689,11 @@ class PanoTagApp:
         self._show_status("Detecting tags — please wait…")
         self.load_btn.config(state="disabled")
         self.export_btn.config(state="disabled")
+        self.edit_tag_btn.config(state="disabled")
+        stem = Path(self.image_path).stem
         def _detect():
             try:
-                tags=self.detector.detect(self.image_path)
+                tags=self.detector.detect(self.image_path, stem)
                 self.root.after(0,lambda:self._on_done(tags))
             except Exception as e:
                 self.root.after(0,lambda:self._on_error(str(e)))
@@ -605,7 +706,9 @@ class PanoTagApp:
         self._show_status(f"Done — {len(tags)} tag(s) detected")
         self._log(f"Detection complete: {len(tags)} tag(s)","ok")
         self.load_btn.config(state="normal")
-        if tags: self.export_btn.config(state="normal")
+        if tags:
+            self.export_btn.config(state="normal")
+            self.edit_tag_btn.config(state="normal")
 
     def _on_error(self,err):
         self._log(f"Error: {err}","error")
@@ -637,6 +740,58 @@ class PanoTagApp:
                 tag["pan_tl"],tag["tilt_tl"],
                 tag["pan_tr"],tag["tilt_tr"],
             ))
+
+    def _edit_selected_tag(self):
+        if not self.tags:
+            return
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo(
+                "Edit tag", "Select a row in the tag table first (or double-click a row).",
+            )
+            return
+        vals = self.tree.item(sel[0], "values")
+        if not vals:
+            return
+        try:
+            tid = int(vals[0])
+        except (TypeError, ValueError):
+            return
+        tag = next((t for t in self.tags if t["tag_id"] == tid), None)
+        if tag is None:
+            return
+        raw = tag.get("system_text", tag["tag_name"])
+        cur = tag["tag_name"]
+        new = simpledialog.askstring(
+            "Edit tag text",
+            f"OCR reading was: {raw}\n\nCorrect label:",
+            initialvalue=cur,
+            parent=self.root,
+        )
+        if new is None:
+            return
+        new = new.strip()
+        if not new:
+            messagebox.showwarning("Edit tag", "Label cannot be empty.")
+            return
+        tag["tag_name"] = new
+        try:
+            from panotag.db import remember_ocr_correction
+            remember_ocr_correction(raw, new)
+        except ImportError:
+            try:
+                _pd = Path(__file__).resolve().parent
+                if str(_pd) not in sys.path:
+                    sys.path.insert(0, str(_pd))
+                import db as _dbmod
+                _dbmod.remember_ocr_correction(raw, new)
+            except Exception as e:
+                self._log(f"Could not save correction to DB: {e}", "warn")
+        except Exception as e:
+            self._log(f"Could not save correction to DB: {e}", "warn")
+        self._populate_table(self.tags)
+        self._show_annotated()
+        self._log(f"Tag #{tid} set to '{new}' (saved for next run if OCR repeats '{raw}')", "ok")
 
     def _clear_table(self):
         for row in self.tree.get_children(): self.tree.delete(row)
