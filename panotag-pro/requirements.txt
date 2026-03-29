@@ -1,0 +1,19 @@
+# Python 3.11+ recommended. Install PyTorch + CUDA 12.1 separately, e.g.:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+sqlalchemy>=2.0.0
+numpy>=1.24.0
+opencv-python>=4.8.0
+openpyxl>=3.1.0
+Pillow>=10.0.0
+ultralytics>=8.0.0
+PyTurboJPEG
+pynvml>=11.5.0
+
+# OCR (GPU): install paddlepaddle-gpu from Paddle docs if needed; CPU:
+# paddlepaddle>=2.5.0
+# paddleocr>=2.7.0
+# Fallback:
+easyocr>=1.7.0

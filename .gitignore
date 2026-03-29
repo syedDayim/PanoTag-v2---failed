@@ -1,9 +1,9 @@
 # Local uploads / caches (can be hundreds of MB)
-panotag/user_data/
+superseded/panotag/user_data/
 
 # Local OCR correction DB (optional: remove this line if you want to version it)
-panotag/tags.db
-
+superseded/panotag/tags.db
+/superseded/panotag/
 __pycache__/
 *.pyc
 *.pyo

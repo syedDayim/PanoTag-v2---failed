@@ -1,1 +1,0 @@
-# PanoTag package
